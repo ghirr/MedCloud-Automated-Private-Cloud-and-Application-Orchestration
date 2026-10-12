@@ -1,0 +1,51 @@
+---
+# tasks file for monitoring
+
+- name: Install dependencies
+  apt:
+    name:
+      - docker.io
+      - docker-compose
+    update_cache: yes
+    state: present
+
+- name: Enable docker service
+  systemd:
+    name: docker
+    enabled: yes
+    state: started
+
+- name: Create monitoring directory
+  file:
+    path: /opt/monitoring
+    state: directory
+    mode: "0755"
+
+- name: Copy docker-compose file
+  template:
+    src: docker-compose.yml.j2
+    dest: /opt/monitoring/docker-compose.yml
+    mode: "0644"
+
+- name: Copy Prometheus configuration
+  template:
+    src: prometheus.yml.j2
+    dest: /opt/monitoring/prometheus.yml
+    mode: "0644"
+
+- name: Stop existing monitoring stack
+  command: docker-compose down
+  args:
+    chdir: /opt/monitoring
+  ignore_errors: yes
+
+- name: Copy Prometheus configuration
+  template:
+    src: prometheus.yml.j2
+    dest: /opt/monitoring/prometheus.yml
+    mode: "0644"
+
+- name: Start monitoring stack
+  command: docker-compose up -d
+  args:
+    chdir: /opt/monitoring

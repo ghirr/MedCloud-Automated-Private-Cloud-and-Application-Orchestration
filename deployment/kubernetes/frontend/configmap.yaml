@@ -1,0 +1,10 @@
+# Non-sensitive frontend config (consumed by an nginx entrypoint script
+# that generates env.js for the Angular app at container startup —
+# see README for the runtime-config pattern)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-config
+  namespace: webapp
+data:
+  API_BASE_URL: "http://backend:8080"

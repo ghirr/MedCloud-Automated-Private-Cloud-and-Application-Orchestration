@@ -1,0 +1,670 @@
+heat_template_version: 2018-08-31
+
+description: >
+  Kubernetes Cluster - Project group5
+  Creates: router, private network + subnet (10.10.0.0/24), 3 instances
+  (1 master + 2 workers), 1 volume per instance, floating IPs on all 3,
+  a dedicated 'ansible' user on each node, and security groups
+  for Kubernetes and Ansible communication.
+  Designed to be driven by Ansible running on the OpenStack controller
+  node itself (over the floating IPs) — not from inside the cluster.
+
+parameters:
+
+  # ── Key / Auth ────────────────────────────────────────────
+  key_name:
+    type: string
+    description: Existing Nova key pair name for SSH access
+    default: my-key
+    constraints:
+      - custom_constraint: nova.keypair
+
+  ssh_key_path:
+    type: string
+    description: >
+      Path, on the Ansible control host (this OpenStack controller node),
+      to the private key file that matches key_name. Used only to build
+      the convenience SSH/Ansible strings in the outputs section.
+    default: ~/.ssh/my-key
+
+  # ── Image ────────────────────────────────────────────────
+  node_image:
+    type: string
+    description: Image for all Kubernetes nodes
+    default: ubuntu-22.04
+    constraints:
+      - custom_constraint: glance.image
+
+  # ── Flavors ──────────────────────────────────────────────
+  master_flavor:
+    type: string
+    description: Flavor for the Kubernetes master node
+    default: m1.medium
+    constraints:
+      - custom_constraint: nova.flavor
+
+  worker_flavor:
+    type: string
+    description: Flavor for the Kubernetes worker nodes
+    default: m1.medium
+    constraints:
+      - custom_constraint: nova.flavor
+
+  # ── Network ──────────────────────────────────────────────
+  external_network:
+    type: string
+    description: >
+      Name or ID of the shared provider/external network in the admin project.
+      Heat resolves it by name — no need to recreate it in group5.
+    default: provider
+
+  private_network_cidr:
+    type: string
+    description: CIDR block for the private tenant network in group5
+    default: 10.10.0.0/24
+
+  dns_nameservers:
+    type: comma_delimited_list
+    description: DNS resolvers for the private subnet
+    default: 8.8.8.8,8.8.4.4
+
+  # ── Storage ──────────────────────────────────────────────
+  master_volume_size:
+    type: number
+    description: Size (GB) of the master node data volume
+    default: 20
+    constraints:
+      - range: { min: 1, max: 1000 }
+
+  worker_volume_size:
+    type: number
+    description: Size (GB) of each worker node data volume
+    default: 20
+    constraints:
+      - range: { min: 1, max: 1000 }
+
+  # ── Ansible user public key ───────────────────────────────
+  ansible_public_key:
+    type: string
+    description: >
+      Optional: an *additional* SSH public key to trust for the 'ansible'
+      user on every node, on top of the key_name keypair. Normally left
+      empty — the Ansible control host (this controller node) already
+      holds the private half of key_name, which is the standard case
+      when Ansible runs directly from the OpenStack controller.
+    default: ""
+
+resources:
+
+  # ════════════════════════════════════════════════════════
+  # NETWORKING
+  # ════════════════════════════════════════════════════════
+
+  private_network:
+    type: OS::Neutron::Net
+    properties:
+      name: k8s-private-net
+      admin_state_up: true
+
+  private_subnet:
+    type: OS::Neutron::Subnet
+    depends_on: private_network
+    properties:
+      name: k8s-private-subnet
+      network_id: { get_resource: private_network }
+      cidr: { get_param: private_network_cidr }
+      enable_dhcp: true
+      dns_nameservers: { get_param: dns_nameservers }
+
+  router:
+    type: OS::Neutron::Router
+    properties:
+      name: k8s-router
+      admin_state_up: true
+      external_gateway_info:
+        # References the shared provider network from the admin project.
+        # enable_snat omitted — not allowed by policy in non-admin projects.
+        network: { get_param: external_network }
+
+  router_interface:
+    type: OS::Neutron::RouterInterface
+    depends_on: [router, private_subnet]
+    properties:
+      router_id: { get_resource: router }
+      subnet_id: { get_resource: private_subnet }
+
+  # ════════════════════════════════════════════════════════
+  # SECURITY GROUPS
+  # ════════════════════════════════════════════════════════
+
+  master_security_group:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: k8s-sg-master
+      description: Kubernetes master - API server, etcd, kubelet, Ansible SSH
+      rules:
+        - protocol: icmp
+          remote_ip_prefix: 0.0.0.0/0
+        - protocol: tcp
+          port_range_min: 22
+          port_range_max: 22
+          remote_ip_prefix: 0.0.0.0/0
+        - protocol: tcp
+          port_range_min: 6443
+          port_range_max: 6443
+          remote_ip_prefix: 0.0.0.0/0
+        - protocol: tcp
+          port_range_min: 2379
+          port_range_max: 2380
+          remote_ip_prefix: { get_param: private_network_cidr }
+        - protocol: tcp
+          port_range_min: 10250
+          port_range_max: 10250
+          remote_ip_prefix: { get_param: private_network_cidr }
+        - protocol: tcp
+          port_range_min: 10257
+          port_range_max: 10257
+          remote_ip_prefix: { get_param: private_network_cidr }
+        - protocol: tcp
+          port_range_min: 10259
+          port_range_max: 10259
+          remote_ip_prefix: { get_param: private_network_cidr }
+        - protocol: tcp
+          port_range_min: 30000
+          port_range_max: 32767
+          remote_ip_prefix: 0.0.0.0/0
+
+  worker_security_group:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: k8s-sg-worker
+      description: Kubernetes workers - kubelet, overlay networking, Ansible SSH
+      rules:
+        - protocol: icmp
+          remote_ip_prefix: 0.0.0.0/0
+        - protocol: tcp
+          port_range_min: 22
+          port_range_max: 22
+          remote_ip_prefix: 0.0.0.0/0
+        - protocol: tcp
+          port_range_min: 10250
+          port_range_max: 10250
+          remote_ip_prefix: { get_param: private_network_cidr }
+        - protocol: udp
+          port_range_min: 8472
+          port_range_max: 8472
+          remote_ip_prefix: { get_param: private_network_cidr }
+        - protocol: udp
+          port_range_min: 4789
+          port_range_max: 4789
+          remote_ip_prefix: { get_param: private_network_cidr }
+        - protocol: tcp
+          port_range_min: 179
+          port_range_max: 179
+          remote_ip_prefix: { get_param: private_network_cidr }
+        - protocol: tcp
+          port_range_min: 30000
+          port_range_max: 32767
+          remote_ip_prefix: 0.0.0.0/0
+
+  # ════════════════════════════════════════════════════════
+  # PORTS
+  # ════════════════════════════════════════════════════════
+
+  master_port:
+    type: OS::Neutron::Port
+    depends_on: [router_interface, master_security_group]
+    properties:
+      name: k8s-port-master
+      network_id: { get_resource: private_network }
+      fixed_ips:
+        - subnet_id: { get_resource: private_subnet }
+      security_groups:
+        - { get_resource: master_security_group }
+
+  worker1_port:
+    type: OS::Neutron::Port
+    depends_on: [router_interface, worker_security_group]
+    properties:
+      name: k8s-port-worker1
+      network_id: { get_resource: private_network }
+      fixed_ips:
+        - subnet_id: { get_resource: private_subnet }
+      security_groups:
+        - { get_resource: worker_security_group }
+
+  worker2_port:
+    type: OS::Neutron::Port
+    depends_on: [router_interface, worker_security_group]
+    properties:
+      name: k8s-port-worker2
+      network_id: { get_resource: private_network }
+      fixed_ips:
+        - subnet_id: { get_resource: private_subnet }
+      security_groups:
+        - { get_resource: worker_security_group }
+
+  # ════════════════════════════════════════════════════════
+  # VOLUMES
+  # One volume per instance (mounted as /dev/vdb inside the VM)
+  # ════════════════════════════════════════════════════════
+
+  master_volume:
+    type: OS::Cinder::Volume
+    deletion_policy: Delete
+    properties:
+      name: k8s-vol-master
+      size: { get_param: master_volume_size }
+
+  worker1_volume:
+    type: OS::Cinder::Volume
+    deletion_policy: Delete
+    properties:
+      name: k8s-vol-worker1
+      size: { get_param: worker_volume_size }
+
+  worker2_volume:
+    type: OS::Cinder::Volume
+    deletion_policy: Delete
+    properties:
+      name: k8s-vol-worker2
+      size: { get_param: worker_volume_size }
+
+  # ════════════════════════════════════════════════════════
+  # INSTANCES
+  # ════════════════════════════════════════════════════════
+
+  master_instance:
+    type: OS::Nova::Server
+    depends_on: master_port
+    properties:
+      name: k8s-master
+      image: { get_param: node_image }
+      flavor: { get_param: master_flavor }
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: master_port }
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          template: |
+            #!/bin/bash
+            set -e
+
+            # ── ansible user ─────────────────────────────────
+            useradd -m -s /bin/bash ansible
+            echo "ansible ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ansible
+            chmod 440 /etc/sudoers.d/ansible
+            mkdir -p /home/ansible/.ssh
+            chmod 700 /home/ansible/.ssh
+            cp /home/ubuntu/.ssh/authorized_keys /home/ansible/.ssh/authorized_keys
+            EXTRA_KEY="$ANSIBLE_PUBKEY"
+            if [ -n "$EXTRA_KEY" ]; then
+              echo "$EXTRA_KEY" >> /home/ansible/.ssh/authorized_keys
+            fi
+            chown -R ansible:ansible /home/ansible/.ssh
+            chmod 600 /home/ansible/.ssh/authorized_keys
+
+            # ── hostname ─────────────────────────────────────
+            hostnamectl set-hostname k8s-master
+
+            # ── base packages ────────────────────────────────
+            apt-get update -y
+            apt-get install -y curl wget git net-tools
+
+            # ── disable swap ─────────────────────────────────
+            swapoff -a
+            sed -i '/ swap / s/^/#/' /etc/fstab
+
+            # ── kernel modules ───────────────────────────────
+            cat <<EOF > /etc/modules-load.d/k8s.conf
+            overlay
+            br_netfilter
+            EOF
+            modprobe overlay
+            modprobe br_netfilter
+
+            # ── sysctl ───────────────────────────────────────
+            cat <<EOF > /etc/sysctl.d/k8s.conf
+            net.bridge.bridge-nf-call-iptables  = 1
+            net.bridge.bridge-nf-call-ip6tables = 1
+            net.ipv4.ip_forward                 = 1
+            EOF
+            sysctl --system
+
+            # ── format and mount data volume (/dev/vdb) ──────
+            sleep 10
+            if [ -b /dev/vdb ]; then
+              mkfs.ext4 /dev/vdb
+              mkdir -p /mnt/data
+              echo "/dev/vdb /mnt/data ext4 defaults 0 2" >> /etc/fstab
+              mount -a
+            fi
+
+            echo "k8s-master ready for Ansible provisioning" > /etc/motd
+          params:
+            $ANSIBLE_PUBKEY: { get_param: ansible_public_key }
+
+  worker1_instance:
+    type: OS::Nova::Server
+    depends_on: worker1_port
+    properties:
+      name: k8s-worker1
+      image: { get_param: node_image }
+      flavor: { get_param: worker_flavor }
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: worker1_port }
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          template: |
+            #!/bin/bash
+            set -e
+
+            useradd -m -s /bin/bash ansible
+            echo "ansible ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ansible
+            chmod 440 /etc/sudoers.d/ansible
+            mkdir -p /home/ansible/.ssh
+            chmod 700 /home/ansible/.ssh
+            cp /home/ubuntu/.ssh/authorized_keys /home/ansible/.ssh/authorized_keys
+            EXTRA_KEY="$ANSIBLE_PUBKEY"
+            if [ -n "$EXTRA_KEY" ]; then
+              echo "$EXTRA_KEY" >> /home/ansible/.ssh/authorized_keys
+            fi
+            chown -R ansible:ansible /home/ansible/.ssh
+            chmod 600 /home/ansible/.ssh/authorized_keys
+
+            hostnamectl set-hostname k8s-worker1
+            apt-get update -y
+            apt-get install -y curl wget git net-tools
+
+            swapoff -a
+            sed -i '/ swap / s/^/#/' /etc/fstab
+
+            cat <<EOF > /etc/modules-load.d/k8s.conf
+            overlay
+            br_netfilter
+            EOF
+            modprobe overlay
+            modprobe br_netfilter
+
+            cat <<EOF > /etc/sysctl.d/k8s.conf
+            net.bridge.bridge-nf-call-iptables  = 1
+            net.bridge.bridge-nf-call-ip6tables = 1
+            net.ipv4.ip_forward                 = 1
+            EOF
+            sysctl --system
+
+            sleep 10
+            if [ -b /dev/vdb ]; then
+              mkfs.ext4 /dev/vdb
+              mkdir -p /mnt/data
+              echo "/dev/vdb /mnt/data ext4 defaults 0 2" >> /etc/fstab
+              mount -a
+            fi
+
+            echo "k8s-worker1 ready for Ansible provisioning" > /etc/motd
+          params:
+            $ANSIBLE_PUBKEY: { get_param: ansible_public_key }
+
+  worker2_instance:
+    type: OS::Nova::Server
+    depends_on: worker2_port
+    properties:
+      name: k8s-worker2
+      image: { get_param: node_image }
+      flavor: { get_param: worker_flavor }
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: worker2_port }
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          template: |
+            #!/bin/bash
+            set -e
+
+            useradd -m -s /bin/bash ansible
+            echo "ansible ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ansible
+            chmod 440 /etc/sudoers.d/ansible
+            mkdir -p /home/ansible/.ssh
+            chmod 700 /home/ansible/.ssh
+            cp /home/ubuntu/.ssh/authorized_keys /home/ansible/.ssh/authorized_keys
+            EXTRA_KEY="$ANSIBLE_PUBKEY"
+            if [ -n "$EXTRA_KEY" ]; then
+              echo "$EXTRA_KEY" >> /home/ansible/.ssh/authorized_keys
+            fi
+            chown -R ansible:ansible /home/ansible/.ssh
+            chmod 600 /home/ansible/.ssh/authorized_keys
+
+            hostnamectl set-hostname k8s-worker2
+            apt-get update -y
+            apt-get install -y curl wget git net-tools
+
+            swapoff -a
+            sed -i '/ swap / s/^/#/' /etc/fstab
+
+            cat <<EOF > /etc/modules-load.d/k8s.conf
+            overlay
+            br_netfilter
+            EOF
+            modprobe overlay
+            modprobe br_netfilter
+
+            cat <<EOF > /etc/sysctl.d/k8s.conf
+            net.bridge.bridge-nf-call-iptables  = 1
+            net.bridge.bridge-nf-call-ip6tables = 1
+            net.ipv4.ip_forward                 = 1
+            EOF
+            sysctl --system
+
+            sleep 10
+            if [ -b /dev/vdb ]; then
+              mkfs.ext4 /dev/vdb
+              mkdir -p /mnt/data
+              echo "/dev/vdb /mnt/data ext4 defaults 0 2" >> /etc/fstab
+              mount -a
+            fi
+
+            echo "k8s-worker2 ready for Ansible provisioning" > /etc/motd
+          params:
+            $ANSIBLE_PUBKEY: { get_param: ansible_public_key }
+
+  # ════════════════════════════════════════════════════════
+  # VOLUME ATTACHMENTS
+  # ════════════════════════════════════════════════════════
+
+  master_volume_attachment:
+    type: OS::Cinder::VolumeAttachment
+    depends_on: master_instance
+    properties:
+      volume_id: { get_resource: master_volume }
+      instance_uuid: { get_resource: master_instance }
+      mountpoint: /dev/vdb
+
+  worker1_volume_attachment:
+    type: OS::Cinder::VolumeAttachment
+    depends_on: worker1_instance
+    properties:
+      volume_id: { get_resource: worker1_volume }
+      instance_uuid: { get_resource: worker1_instance }
+      mountpoint: /dev/vdb
+
+  worker2_volume_attachment:
+    type: OS::Cinder::VolumeAttachment
+    depends_on: worker2_instance
+    properties:
+      volume_id: { get_resource: worker2_volume }
+      instance_uuid: { get_resource: worker2_instance }
+      mountpoint: /dev/vdb
+
+  # ════════════════════════════════════════════════════════
+  # FLOATING IPs
+  # ════════════════════════════════════════════════════════
+
+  master_floating_ip:
+    type: OS::Neutron::FloatingIP
+    depends_on: [master_port, router_interface]
+    properties:
+      floating_network: { get_param: external_network }
+      port_id: { get_resource: master_port }
+
+  worker1_floating_ip:
+    type: OS::Neutron::FloatingIP
+    depends_on: [worker1_port, router_interface]
+    properties:
+      floating_network: { get_param: external_network }
+      port_id: { get_resource: worker1_port }
+
+  worker2_floating_ip:
+    type: OS::Neutron::FloatingIP
+    depends_on: [worker2_port, router_interface]
+    properties:
+      floating_network: { get_param: external_network }
+      port_id: { get_resource: worker2_port }
+
+outputs:
+
+  # ── Network ──────────────────────────────────────────────
+  network_id:
+    description: Private network ID
+    value: { get_resource: private_network }
+
+  subnet_id:
+    description: Private subnet ID (10.10.0.0/24)
+    value: { get_resource: private_subnet }
+
+  router_id:
+    description: Router ID
+    value: { get_resource: router }
+
+  # ── Master ───────────────────────────────────────────────
+  master_instance_id:
+    description: Master node instance ID
+    value: { get_resource: master_instance }
+
+  master_private_ip:
+    description: Private IP of the master node
+    value: { get_attr: [master_instance, first_address] }
+
+  master_floating_ip_address:
+    description: Public floating IP of the master node
+    value: { get_attr: [master_floating_ip, floating_ip_address] }
+
+  master_volume_id:
+    description: Master data volume ID
+    value: { get_resource: master_volume }
+
+  master_ssh_ubuntu:
+    description: SSH to master as ubuntu (from this controller node)
+    value:
+      str_replace:
+        template: ssh -i KEY ubuntu@FIP
+        params:
+          FIP: { get_attr: [master_floating_ip, floating_ip_address] }
+          KEY: { get_param: ssh_key_path }
+
+  master_ssh_ansible:
+    description: SSH to master as ansible (from this controller node)
+    value:
+      str_replace:
+        template: ssh -i KEY ansible@FIP
+        params:
+          FIP: { get_attr: [master_floating_ip, floating_ip_address] }
+          KEY: { get_param: ssh_key_path }
+
+  # ── Worker 1 ─────────────────────────────────────────────
+  worker1_instance_id:
+    description: Worker 1 instance ID
+    value: { get_resource: worker1_instance }
+
+  worker1_private_ip:
+    description: Private IP of worker 1
+    value: { get_attr: [worker1_instance, first_address] }
+
+  worker1_floating_ip_address:
+    description: Public floating IP of worker 1
+    value: { get_attr: [worker1_floating_ip, floating_ip_address] }
+
+  worker1_volume_id:
+    description: Worker 1 data volume ID
+    value: { get_resource: worker1_volume }
+
+  worker1_ssh_ansible:
+    description: SSH to worker 1 as ansible (from this controller node)
+    value:
+      str_replace:
+        template: ssh -i KEY ansible@FIP
+        params:
+          FIP: { get_attr: [worker1_floating_ip, floating_ip_address] }
+          KEY: { get_param: ssh_key_path }
+
+  # ── Worker 2 ─────────────────────────────────────────────
+  worker2_instance_id:
+    description: Worker 2 instance ID
+    value: { get_resource: worker2_instance }
+
+  worker2_private_ip:
+    description: Private IP of worker 2
+    value: { get_attr: [worker2_instance, first_address] }
+
+  worker2_floating_ip_address:
+    description: Public floating IP of worker 2
+    value: { get_attr: [worker2_floating_ip, floating_ip_address] }
+
+  worker2_volume_id:
+    description: Worker 2 data volume ID
+    value: { get_resource: worker2_volume }
+
+  worker2_ssh_ansible:
+    description: SSH to worker 2 as ansible (from this controller node)
+    value:
+      str_replace:
+        template: ssh -i KEY ansible@FIP
+        params:
+          FIP: { get_attr: [worker2_floating_ip, floating_ip_address] }
+          KEY: { get_param: ssh_key_path }
+
+  # ── Ansible inventory (controller-driven) ─────────────────
+  ansible_inventory_hint:
+    description: >
+      Ready-to-use Ansible inventory for running playbooks directly from
+      this controller node — no Ansible install needed on k8s-master.
+      Save as inventory.ini in your k8s-ansible directory.
+    value:
+      str_replace:
+        template: |
+          [master]
+          k8s-master ansible_host=MASTER_FIP
+
+          [workers]
+          k8s-worker1 ansible_host=WORKER1_FIP
+          k8s-worker2 ansible_host=WORKER2_FIP
+
+          [k8s:children]
+          master
+          workers
+
+          [k8s:vars]
+          ansible_user=ansible
+          ansible_ssh_private_key_file=KEY
+        params:
+          MASTER_FIP:  { get_attr: [master_floating_ip,  floating_ip_address] }
+          WORKER1_FIP: { get_attr: [worker1_floating_ip, floating_ip_address] }
+          WORKER2_FIP: { get_attr: [worker2_floating_ip, floating_ip_address] }
+          KEY: { get_param: ssh_key_path }
+
+  # ── ansible.cfg (controller-driven) ───────────────────────
+  ansible_cfg_hint:
+    description: >
+      Recommended ansible.cfg for this controller node. Setting
+      host_key_checking = False avoids "REMOTE HOST IDENTIFICATION HAS
+      CHANGED" failures whenever this stack is deleted/recreated, since
+      the floating IPs get reassigned to new hosts with new SSH host keys.
+    value: |
+      [defaults]
+      inventory = ./inventory.ini
+      remote_user = ansible
+      host_key_checking = False
+      retry_files_enabled = False

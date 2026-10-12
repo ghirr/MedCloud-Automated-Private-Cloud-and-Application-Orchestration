@@ -1,0 +1,12 @@
+# Non-sensitive backend config
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backend-config
+  namespace: webapp
+data:
+  SPRING_PROFILES_ACTIVE: "prod"
+  DB_HOST: "mysql"
+  DB_PORT: "3306"
+  DB_NAME: "givecircle"
+  SERVER_PORT: "8080"

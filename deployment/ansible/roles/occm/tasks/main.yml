@@ -1,0 +1,148 @@
+---
+# tasks file for roles/occm
+
+# ── cloud.conf ────────────────────────────────────────────────────────────────
+
+- name: Créer le fichier cloud.conf
+  copy:
+    dest: /etc/kubernetes/cloud.conf
+    owner: root
+    group: root
+    mode: '0600'
+    content: |
+      [Global]
+      auth-url=http://192.168.1.11:5000/v3
+      username=admin
+      password=root
+      tenant-id=a32552d2343c4b1b8487b4540f96977e
+      domain-name=Default
+      region=RegionOne
+
+      [LoadBalancer]
+      use-octavia=true
+      subnet-id=37752196-c100-43db-a52b-6e6d15d47040
+      floating-network-id=67bf785a-80b7-4604-975d-51168294d0ed
+      create-monitor=true
+      monitor-delay=5s
+      monitor-timeout=3s
+      monitor-max-retries=3
+
+      [BlockStorage]
+      bs-version=v3
+
+# ── Secret Kubernetes ─────────────────────────────────────────────────────────
+
+- name: Créer ou mettre à jour le secret cloud-config
+  shell: >
+    kubectl create secret generic cloud-config
+    --from-file=cloud.conf=/etc/kubernetes/cloud.conf
+    -n kube-system
+    --dry-run=client -o yaml | kubectl apply -f -
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  register: secret_apply
+  changed_when: "'configured' in secret_apply.stdout or 'created' in secret_apply.stdout"
+
+# ── RBAC ──────────────────────────────────────────────────────────────────────
+
+- name: Appliquer les rôles RBAC pour OCCM
+  command: >
+    kubectl apply -f
+    https://raw.githubusercontent.com/kubernetes/cloud-provider-openstack/master/manifests/controller-manager/cloud-controller-manager-roles.yaml
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+
+- name: Appliquer les bindings RBAC pour OCCM
+  command: >
+    kubectl apply -f
+    https://raw.githubusercontent.com/kubernetes/cloud-provider-openstack/master/manifests/controller-manager/cloud-controller-manager-role-bindings.yaml
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+
+# ── DaemonSet OCCM ────────────────────────────────────────────────────────────
+
+- name: Déployer le DaemonSet OCCM
+  command: >
+    kubectl apply -f
+    https://raw.githubusercontent.com/kubernetes/cloud-provider-openstack/master/manifests/controller-manager/openstack-cloud-controller-manager-ds.yaml
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+
+- name: Redémarrer le pod OCCM pour prendre en compte le secret à jour
+  shell: kubectl delete pod -n kube-system -l k8s-app=openstack-cloud-controller-manager --ignore-not-found
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  when: secret_apply.changed
+
+# ── Attendre que OCCM soit prêt ───────────────────────────────────────────────
+
+- name: Attendre que le pod OCCM soit en Running
+  command: >
+    kubectl get pods -n kube-system
+    -l k8s-app=openstack-cloud-controller-manager
+    -o jsonpath='{.items[0].status.phase}'
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  register: occm_phase
+  until: occm_phase.stdout == "Running"
+  retries: 18
+  delay: 10
+  changed_when: false
+  failed_when: false
+
+- name: Afficher le statut du pod OCCM
+  debug:
+    msg: "OCCM pod status: {{ occm_phase.stdout }}"
+
+# ── Vérifier les logs ─────────────────────────────────────────────────────────
+
+- name: Récupérer le nom du pod OCCM
+  command: >
+    kubectl get pods -n kube-system
+    -l k8s-app=openstack-cloud-controller-manager
+    -o jsonpath='{.items[0].metadata.name}'
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  register: occm_pod_name
+  changed_when: false
+
+- name: Afficher les logs du pod OCCM (previous si crash, sinon courant)
+  shell: >
+    kubectl logs -n kube-system {{ occm_pod_name.stdout }} --tail=50 --previous 2>/dev/null
+    || kubectl logs -n kube-system {{ occm_pod_name.stdout }} --tail=50
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  register: occm_logs
+  changed_when: false
+  failed_when: false
+  when: occm_pod_name.stdout != ""
+
+- name: Afficher les logs
+  debug:
+    msg: "{{ occm_logs.stdout_lines if occm_logs.rc == 0 else 'Logs indisponibles: ' + occm_logs.stderr }}"
+  when: occm_pod_name.stdout != ""
+
+- name: Vérifier absence d'erreurs d'authentification
+  assert:
+    that:
+      - "'401' not in occm_logs.stdout"
+      - "'Unauthorized' not in occm_logs.stdout"
+      - "'connection refused' not in occm_logs.stdout | lower"
+    fail_msg: >
+      Erreur d'authentification détectée dans les logs OCCM.
+      Vérifiez cloud.conf : auth-url, password, tenant-id.
+    success_msg: "OCCM authentifié avec succès contre OpenStack."
+  when: occm_pod_name.stdout != "" and occm_logs.rc == 0
+
+# ── Statut des noeuds ─────────────────────────────────────────────────────────
+
+- name: Afficher le statut des noeuds
+  command: kubectl get nodes -o wide
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  register: nodes_out
+  changed_when: false
+
+- name: Afficher les noeuds
+  debug:
+    msg: "{{ nodes_out.stdout_lines }}"

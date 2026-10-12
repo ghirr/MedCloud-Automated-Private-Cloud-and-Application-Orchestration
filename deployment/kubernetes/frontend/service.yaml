@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: webapp
+spec:
+  # type: LoadBalancer auto-provisions an Octavia LB IF the OpenStack
+  # cloud-provider (cloud-controller-manager) is installed in the cluster.
+  # If it isn't, switch this to NodePort and point an Octavia LB pool at
+  # <worker-node-ips>:<nodePort> manually.
+  type: LoadBalancer
+  selector:
+    app: frontend
+  ports:
+    - port: 80
+      targetPort: 80

@@ -1,0 +1,47 @@
+---
+# tasks file for roles/worker
+
+- name: Réinitialiser le noeud (idempotent, sans effet si déjà propre)
+  command: kubeadm reset -f
+  register: kubeadm_reset_result
+  changed_when: false
+  failed_when: false
+
+- name: Nettoyer les fichiers et répertoires Kubernetes résiduels
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/kubernetes
+    - /etc/cni/net.d
+    - /var/lib/kubelet
+    - /home/ubuntu/.kube
+
+- name: Nettoyer les règles iptables
+  shell: |
+    iptables -F
+    iptables -t nat -F
+    iptables -t mangle -F
+    iptables -X
+
+- name: Redémarrer kubelet
+  service:
+    name: kubelet
+    state: restarted
+
+- name: Supprimer le Node existant sur le master (rejoin propre)
+  command: kubectl delete node {{ ansible_hostname }} --ignore-not-found
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  delegate_to: "{{ groups['master'][0] }}"
+  failed_when: false
+  changed_when: false
+
+- name: Copier commande join
+  copy:
+    src: join-command.sh
+    dest: /tmp/join-command.sh
+    mode: '0700'
+
+- name: Joindre le cluster
+  shell: sh /tmp/join-command.sh

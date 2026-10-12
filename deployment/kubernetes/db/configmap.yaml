@@ -1,0 +1,8 @@
+# Non-sensitive DB config (per "ConfigMap pour configs non-sensibles")
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-config
+  namespace: webapp
+data:
+  MYSQL_DATABASE: "givecircle"

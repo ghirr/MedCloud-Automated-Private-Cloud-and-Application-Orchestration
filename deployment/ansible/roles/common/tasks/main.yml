@@ -1,0 +1,97 @@
+---
+# tasks file for roles/common
+- name: Désactiver le swap
+  shell: swapoff -a
+
+- name: Supprimer swap du fstab
+  replace:
+    path: /etc/fstab
+    regexp: '^.*swap.*$'
+    replace: ''
+
+- name: Installer les paquets nécessaires
+  apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gpg
+      - conntrack
+      - socat
+    state: present
+    update_cache: yes
+
+- name: Charger les modules
+  shell: |
+    modprobe overlay
+    modprobe br_netfilter
+
+- name: Configurer sysctl
+  copy:
+    dest: /etc/sysctl.d/kubernetes.conf
+    content: |
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.bridge.bridge-nf-call-iptables = 1
+      net.ipv4.ip_forward = 1
+
+- name: Appliquer sysctl
+  command: sysctl --system
+
+- name: Installer containerd
+  apt:
+    name: containerd
+    state: present
+
+- name: Créer config containerd
+  shell: |
+    mkdir -p /etc/containerd
+    containerd config default > /etc/containerd/config.toml
+
+- name: Redémarrer containerd
+  service:
+    name: containerd
+    state: restarted
+    enabled: yes
+
+- name: Créer le dossier /etc/apt/keyrings
+  file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
+
+- name: Télécharger la clé Kubernetes
+  shell: |
+    curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key | \
+    gpg --batch --yes --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  args:
+    creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+- name: Ajouter dépôt Kubernetes
+  copy:
+    dest: /etc/apt/sources.list.d/kubernetes.list
+    content: |
+      deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /
+
+- name: Mise à jour apt
+  apt:
+    update_cache: yes
+
+- name: Installer kubeadm kubelet kubectl
+  apt:
+    name:
+      - kubelet
+      - kubeadm
+      - kubectl
+    state: present
+
+- name: Bloquer versions
+  shell: apt-mark hold kubelet kubeadm kubectl
+
+- name: Ajouter les entrées /etc/hosts pour tous les noeuds du cluster
+  lineinfile:
+    path: /etc/hosts
+    regexp: '^(?!127\.).*\s{{ hostvars[item].ansible_hostname }}$'
+    line: "{{ hostvars[item].ansible_default_ipv4.address }} {{ hostvars[item].ansible_hostname }}"
+    state: present
+  loop: "{{ groups['k8s'] }}"
+  when: hostvars[item].ansible_hostname is defined

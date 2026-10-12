@@ -1,0 +1,358 @@
+heat_template_version: 2018-08-31
+
+description: >
+  Scenario 3/3 - Full infrastructure deployment with Heat.
+  Creates: router, private network + subnet, 2 instances (web + db),
+  individual volumes for each instance, floating IP on the web instance,
+  and separate security groups per role.
+
+parameters:
+
+  # ── Key / Auth ────────────────────────────────────────────
+  key_name:
+    type: string
+    description: Existing Nova key pair name for SSH access
+    default: my-key
+    constraints:
+      - custom_constraint: nova.keypair
+
+  # ── Images ───────────────────────────────────────────────
+  web_image:
+    type: string
+    description: Image for the web/frontend instance
+    default: ubuntu-22.04
+    constraints:
+      - custom_constraint: glance.image
+
+  db_image:
+    type: string
+    description: Image for the database instance
+    default: ubuntu-22.04
+    constraints:
+      - custom_constraint: glance.image
+
+  # ── Flavors ──────────────────────────────────────────────
+  web_flavor:
+    type: string
+    description: Flavor for the web instance
+    default: m1.medium
+    constraints:
+      - custom_constraint: nova.flavor
+
+  db_flavor:
+    type: string
+    description: Flavor for the database instance
+    default: m1.medium
+    constraints:
+      - custom_constraint: nova.flavor
+
+  # ── Network ──────────────────────────────────────────────
+  external_network:
+    type: string
+    description: External/public network name or ID
+    default: provider
+
+  private_network_cidr:
+    type: string
+    description: CIDR block for the private tenant network
+    default: 10.0.0.0/24
+
+  dns_nameservers:
+    type: comma_delimited_list
+    description: DNS resolvers for the private subnet
+    default: 8.8.8.8,8.8.4.4
+
+  # ── Storage ──────────────────────────────────────────────
+  web_volume_size:
+    type: number
+    description: Size (GB) of the web instance data volume
+    default: 10
+    constraints:
+      - range: { min: 1, max: 1000 }
+
+  db_volume_size:
+    type: number
+    description: Size (GB) of the database volume
+    default: 20
+    constraints:
+      - range: { min: 1, max: 1000 }
+
+resources:
+
+  # ════════════════════════════════════════════════════════
+  # NETWORKING
+  # ════════════════════════════════════════════════════════
+
+  private_network:
+    type: OS::Neutron::Net
+    properties:
+      name: heat-private-net
+      admin_state_up: true
+
+  private_subnet:
+    type: OS::Neutron::Subnet
+    depends_on: private_network
+    properties:
+      name: heat-private-subnet
+      network_id: { get_resource: private_network }
+      cidr: { get_param: private_network_cidr }
+      enable_dhcp: true
+      dns_nameservers: { get_param: dns_nameservers }
+
+  router:
+    type: OS::Neutron::Router
+    properties:
+      name: heat-router
+      admin_state_up: true
+      external_gateway_info:
+        network: { get_param: external_network }
+        enable_snat: true
+
+  router_interface:
+    type: OS::Neutron::RouterInterface
+    depends_on: [router, private_subnet]
+    properties:
+      router_id: { get_resource: router }
+      subnet_id: { get_resource: private_subnet }
+
+  # ════════════════════════════════════════════════════════
+  # SECURITY GROUPS
+  # ════════════════════════════════════════════════════════
+
+  web_security_group:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: heat-sg-web
+      description: Web instance - SSH, HTTP, HTTPS, ICMP
+      rules:
+        - protocol: icmp
+          remote_ip_prefix: 0.0.0.0/0
+        - protocol: tcp
+          port_range_min: 22
+          port_range_max: 22
+          remote_ip_prefix: 0.0.0.0/0
+        - protocol: tcp
+          port_range_min: 80
+          port_range_max: 80
+          remote_ip_prefix: 0.0.0.0/0
+        - protocol: tcp
+          port_range_min: 443
+          port_range_max: 443
+          remote_ip_prefix: 0.0.0.0/0
+
+  db_security_group:
+    type: OS::Neutron::SecurityGroup
+    depends_on: web_security_group
+    properties:
+      name: heat-sg-db
+      description: DB instance - SSH from private net, DB ports from web SG
+      rules:
+        - protocol: icmp
+          remote_ip_prefix: { get_param: private_network_cidr }
+        - protocol: tcp
+          port_range_min: 22
+          port_range_max: 22
+          remote_ip_prefix: { get_param: private_network_cidr }
+        - protocol: tcp
+          port_range_min: 5432
+          port_range_max: 5432
+          remote_mode: remote_group_id
+          remote_group_id: { get_resource: web_security_group }
+        - protocol: tcp
+          port_range_min: 3306
+          port_range_max: 3306
+          remote_mode: remote_group_id
+          remote_group_id: { get_resource: web_security_group }
+
+  # ════════════════════════════════════════════════════════
+  # PORTS
+  # ════════════════════════════════════════════════════════
+
+  web_port:
+    type: OS::Neutron::Port
+    depends_on: [router_interface, web_security_group]
+    properties:
+      name: heat-port-web
+      network_id: { get_resource: private_network }
+      fixed_ips:
+        - subnet_id: { get_resource: private_subnet }
+      security_groups:
+        - { get_resource: web_security_group }
+
+  db_port:
+    type: OS::Neutron::Port
+    depends_on: [router_interface, db_security_group]
+    properties:
+      name: heat-port-db
+      network_id: { get_resource: private_network }
+      fixed_ips:
+        - subnet_id: { get_resource: private_subnet }
+      security_groups:
+        - { get_resource: db_security_group }
+
+  # ════════════════════════════════════════════════════════
+  # VOLUMES
+  # ════════════════════════════════════════════════════════
+
+  web_volume:
+    type: OS::Cinder::Volume
+    deletion_policy: Delete
+    properties:
+      name: heat-vol-web
+      size: { get_param: web_volume_size }
+
+  db_volume:
+    type: OS::Cinder::Volume
+    deletion_policy: Delete
+    properties:
+      name: heat-vol-db
+      size: { get_param: db_volume_size }
+
+  # ════════════════════════════════════════════════════════
+  # INSTANCES
+  # ════════════════════════════════════════════════════════
+
+  web_instance:
+    type: OS::Nova::Server
+    depends_on: web_port
+    properties:
+      name: heat-web
+      image: { get_param: web_image }
+      flavor: { get_param: web_flavor }
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: web_port }
+      user_data_format: RAW
+      user_data: |
+        #!/bin/bash
+        apt-get update -y
+        apt-get install -y nginx
+        systemctl enable nginx
+        systemctl start nginx
+        sleep 10
+        DATA_DISK=$(lsblk -rno NAME,TYPE | awk '$2=="disk" && $1!="vda" {print "/dev/"$1; exit}')
+        if [ -n "$DATA_DISK" ]; then
+          mkfs.ext4 "$DATA_DISK"
+          mkdir -p /var/www
+          echo "$DATA_DISK /var/www ext4 defaults 0 2" >> /etc/fstab
+          mount -a
+        fi
+        echo "Heat Scenario 3 - Web Instance" > /etc/motd
+
+  db_instance:
+    type: OS::Nova::Server
+    depends_on: db_port
+    properties:
+      name: heat-db
+      image: { get_param: db_image }
+      flavor: { get_param: db_flavor }
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: db_port }
+      user_data_format: RAW
+      user_data: |
+        #!/bin/bash
+        apt-get update -y
+        apt-get install -y postgresql
+        sleep 10
+        DATA_DISK=$(lsblk -rno NAME,TYPE | awk '$2=="disk" && $1!="vda" {print "/dev/"$1; exit}')
+        if [ -n "$DATA_DISK" ]; then
+          mkfs.ext4 "$DATA_DISK"
+          mkdir -p /var/lib/postgresql/data
+          echo "$DATA_DISK /var/lib/postgresql/data ext4 defaults 0 2" >> /etc/fstab
+          mount -a
+          chown postgres:postgres /var/lib/postgresql/data
+        fi
+        systemctl enable postgresql
+        systemctl start postgresql
+        echo "Heat Scenario 3 - DB Instance" > /etc/motd
+
+  # ════════════════════════════════════════════════════════
+  # VOLUME ATTACHMENTS
+  # ════════════════════════════════════════════════════════
+
+  web_volume_attachment:
+    type: OS::Cinder::VolumeAttachment
+    depends_on: web_instance
+    properties:
+      volume_id: { get_resource: web_volume }
+      instance_uuid: { get_resource: web_instance }
+      mountpoint: /dev/vdb
+
+  db_volume_attachment:
+    type: OS::Cinder::VolumeAttachment
+    depends_on: db_instance
+    properties:
+      volume_id: { get_resource: db_volume }
+      instance_uuid: { get_resource: db_instance }
+      mountpoint: /dev/vdb
+
+  # ════════════════════════════════════════════════════════
+  # FLOATING IP  (web instance only)
+  # ════════════════════════════════════════════════════════
+
+  web_floating_ip:
+    type: OS::Neutron::FloatingIP
+    depends_on: [web_port, router_interface]
+    properties:
+      floating_network: { get_param: external_network }
+      port_id: { get_resource: web_port }
+
+outputs:
+
+  network_id:
+    description: Private network ID
+    value: { get_resource: private_network }
+
+  subnet_id:
+    description: Private subnet ID
+    value: { get_resource: private_subnet }
+
+  router_id:
+    description: Router ID
+    value: { get_resource: router }
+
+  web_instance_id:
+    description: Web instance ID
+    value: { get_resource: web_instance }
+
+  web_private_ip:
+    description: Private IP of the web instance
+    value: { get_attr: [web_instance, first_address] }
+
+  web_floating_ip_address:
+    description: Public floating IP of the web instance
+    value: { get_attr: [web_floating_ip, floating_ip_address] }
+
+  web_volume_id:
+    description: Web data volume ID
+    value: { get_resource: web_volume }
+
+  web_ssh:
+    description: SSH command for the web instance
+    value:
+      str_replace:
+        template: ssh ubuntu@FIP -i ~/my-key.pem
+        params:
+          FIP: { get_attr: [web_floating_ip, floating_ip_address] }
+
+  db_instance_id:
+    description: Database instance ID
+    value: { get_resource: db_instance }
+
+  db_private_ip:
+    description: Private IP of the database instance
+    value: { get_attr: [db_instance, first_address] }
+
+  db_volume_id:
+    description: Database volume ID
+    value: { get_resource: db_volume }
+
+  db_ssh_via_web:
+    description: SSH to DB via web instance (jump host)
+    value:
+      str_replace:
+        template: ssh -J ubuntu@FIP ubuntu@DB_IP -i ~/my-key.pem
+        params:
+          FIP: { get_attr: [web_floating_ip, floating_ip_address] }
+          DB_IP: { get_attr: [db_instance, first_address] }

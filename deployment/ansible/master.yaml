@@ -1,0 +1,7 @@
+---
+- hosts: master
+  become: true
+
+  roles:
+    - master
+    - monitoring

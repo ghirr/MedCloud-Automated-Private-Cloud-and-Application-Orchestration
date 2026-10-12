@@ -1,0 +1,144 @@
+heat_template_version: 2018-08-31
+
+description: >
+  Scenario 2/3 - Deploy a single instance with an attached Cinder volume
+  and a floating IP on the existing selfservice network.
+
+parameters:
+  key_name:
+    type: string
+    description: Name of an existing key pair for SSH access
+    default: my-key
+    constraints:
+      - custom_constraint: nova.keypair
+
+  image_id:
+    type: string
+    description: Image to use for the instance
+    default: ubuntu-22.04
+    constraints:
+      - custom_constraint: glance.image
+
+  flavor:
+    type: string
+    description: Flavor for the instance
+    default: m1.medium
+    constraints:
+      - custom_constraint: nova.flavor
+
+  network:
+    type: string
+    description: Existing internal network name
+    default: selfservice
+
+  external_network:
+    type: string
+    description: External network for floating IP allocation
+    default: provider
+
+  volume_size:
+    type: number
+    description: Size of the data volume in GB
+    default: 10
+    constraints:
+      - range: { min: 1, max: 500 }
+
+resources:
+
+  # ── Security Group ────────────────────────────────────────
+  security_group:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: heat-sg-scenario2
+      description: Allow SSH and ICMP inbound
+      rules:
+        - protocol: tcp
+          port_range_min: 22
+          port_range_max: 22
+          remote_ip_prefix: 0.0.0.0/0
+        - protocol: icmp
+          remote_ip_prefix: 0.0.0.0/0
+
+  # ── Port ──────────────────────────────────────────────────
+  instance_port:
+    type: OS::Neutron::Port
+    depends_on: security_group
+    properties:
+      network: { get_param: network }
+      security_groups:
+        - { get_resource: security_group }
+
+  # ── Instance ──────────────────────────────────────────────
+  instance:
+    type: OS::Nova::Server
+    depends_on: instance_port
+    properties:
+      name: heat-instance-scenario2
+      image: { get_param: image_id }
+      flavor: { get_param: flavor }
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: instance_port }
+      user_data_format: RAW
+      user_data: |
+        #!/bin/bash
+        apt-get update -y
+        sleep 10
+        DATA_DISK=$(lsblk -rno NAME,TYPE | awk '$2=="disk" && $1!="vda" {print "/dev/"$1; exit}')
+        if [ -n "$DATA_DISK" ]; then
+          mkfs.ext4 "$DATA_DISK"
+          mkdir -p /data
+          echo "$DATA_DISK /data ext4 defaults 0 2" >> /etc/fstab
+          mount -a
+          echo "Data volume mounted at /data" >> /var/log/heat-setup.log
+        fi
+        echo "Heat Scenario 2 - Instance with volume and floating IP" > /etc/motd
+
+  # ── Volume ────────────────────────────────────────────────
+  data_volume:
+    type: OS::Cinder::Volume
+    deletion_policy: Delete
+    properties:
+      name: heat-volume-scenario2
+      size: { get_param: volume_size }
+
+  volume_attachment:
+    type: OS::Cinder::VolumeAttachment
+    depends_on: instance
+    properties:
+      volume_id: { get_resource: data_volume }
+      instance_uuid: { get_resource: instance }
+      mountpoint: /dev/vdb
+
+  # ── Floating IP ───────────────────────────────────────────
+  floating_ip:
+    type: OS::Neutron::FloatingIP
+    depends_on: instance_port
+    properties:
+      floating_network: { get_param: external_network }
+      port_id: { get_resource: instance_port }
+
+outputs:
+  instance_id:
+    description: ID of the deployed instance
+    value: { get_resource: instance }
+
+  private_ip:
+    description: Private IP address of the instance
+    value: { get_attr: [instance, first_address] }
+
+  floating_ip_address:
+    description: Public floating IP address
+    value: { get_attr: [floating_ip, floating_ip_address] }
+
+  volume_id:
+    description: ID of the attached Cinder volume
+    value: { get_resource: data_volume }
+
+  ssh_command:
+    description: SSH command to connect to the instance
+    value:
+      str_replace:
+        template: ssh ubuntu@FLOATING_IP -i ~/my-key.pem
+        params:
+          FLOATING_IP: { get_attr: [floating_ip, floating_ip_address] }
