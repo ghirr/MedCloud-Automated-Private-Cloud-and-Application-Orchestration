@@ -479,6 +479,7 @@ docker exec -it grafana grafana-cli admin reset-admin-password '<new-password>'
 | Name | Role |
 | --- | --- |
 | Sirine Kchaw | Compute |
+| Zeineb Korbi | Compute |
 | Oussema Mrabet | Compute |
 | Yasser Jaziri | Compute |
 | Yassine Mharek | Compute |
